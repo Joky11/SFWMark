@@ -1,0 +1,4 @@
+# file: /data1/lyx/project/SFWMark/src/pytorch_fid/inception.py
+# hypothesis_version: 6.151.10
+
+[128, 160, 192, 256, 288, 299, 768, 1008, 1280, 2048, '.', 'DEFAULT', 'bilinear', 'init_weights', 'pretrained', 'weights']

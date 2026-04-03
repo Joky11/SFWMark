@@ -53,35 +53,35 @@
     - 打印 IFFT 后虚部最大绝对值
     - _需求: 6.1, 6.3, 6.4_
 
-  - [ ] 2.3 编写属性测试：嵌入后 Hermitian 对称性与纯实数输出
+  - [x] 2.3 编写属性测试：嵌入后 Hermitian 对称性与纯实数输出
     - **Property 4: 嵌入后 Hermitian 对称性与纯实数输出**
     - 验证嵌入后频域满足 Hermitian 对称性，IFFT 虚部 < 1e-5，输出为 float32
     - 生成器：随机 float 张量 + `st.lists(st.integers(0,1), min_size=1, max_size=32)`
     - **验证: 需求 1.2, 3.6, 3.7, 7.1, 7.3**
 
-  - [ ]* 2.4 编写属性测试：Center-slice 区域隔离
+  - [x] 2.4 编写属性测试：Center-slice 区域隔离
     - **Property 5: Center-slice 区域隔离**
     - 验证嵌入后 `center_slice` 区域之外的所有元素与原始 `z` 完全相同
     - 生成器：随机 float 张量
     - **验证: 需求 3.8, 10.4**
 
-  - [ ]* 2.5 编写属性测试：加性叠加公式正确性
+  - [x] 2.5 编写属性测试：加性叠加公式正确性
     - **Property 6: 加性叠加公式正确性**
     - 验证 Free_Half_Region 中频域系数等于原始系数加上 `alpha * Σ(b_i * K_i)`
     - 生成器：随机张量 + 随机消息 + 固定 alpha
     - **验证: 需求 3.5**
 
-  - [ ]* 2.6 编写属性测试：自适应 Alpha 计算正确性
+  - [x] 2.6 编写属性测试：自适应 Alpha 计算正确性
     - **Property 11: 自适应 Alpha 计算正确性**
     - 验证自适应模式下 `alpha = alpha_scale * std(X_free)`
     - 生成器：随机 float 张量 + `st.floats(0.1, 2.0)`
     - **验证: 需求 4.2**
 
-- [ ] 3. 检查点 - 确保嵌入器核心功能正确
+- [x] 3. 检查点 - 确保嵌入器核心功能正确
   - 确保所有测试通过，如有疑问请向用户确认。
 
 
-- [ ] 4. 实现 OSS_Extractor 水印提取器
+- [-] 4. 实现 OSS_Extractor 水印提取器
   - [ ] 4.1 在 `src/oss.py` 中实现 `oss_extract(z_hat, seed, num_bits, debug)` 函数
     - 提取中心区域并 FFT，获取 Free_Half_Region `X_hat[:, :, :, 23:]`
     - 均值归一化：`X_hat_free -= X_hat_free.mean()`，消除直流偏置

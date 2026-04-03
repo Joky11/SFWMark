@@ -14,6 +14,7 @@ import numpy as np
 import cv2
 
 import torch
+import torch.nn.functional as F
 import torchvision.transforms as tforms
 from bm3d import bm3d_rgb
 
@@ -407,7 +408,103 @@ def qr_abs(boolean_tensor, input_tensor, delta=0): # boolean → qr_abs tensor
     return torch.where(boolean_tensor, input_tensor.abs() + delta, -input_tensor.abs() - delta)
 
 @torch.no_grad()
-def inject_hsqr(inverted_latent, qr_tensor, center=False, device="cuda"): # (N,4,64,64) -> (N,4,64,64)
+def _build_hsqr_wm_complex(qr_tensor, target_h, target_w, device):
+    """
+    Build HSQR watermark map on Cartesian FFT grid.
+    Returns:
+        wm_complex: (N,4,H,W) complex64
+        wm_mask: (N,4,H,W) bool
+    """
+    n = qr_tensor.shape[0]
+    c_all = 4
+    qr_len = qr_tensor.shape[-1]
+    row_start = (target_h - qr_len) // 2
+    col_start = (target_w - qr_len) // 2
+    row_slice = slice(row_start, row_start + qr_len)
+    col_slice = slice(col_start, col_start + qr_len)
+
+    qr_sign = qr_tensor.to(device=device, dtype=torch.float32) * 2.0 - 1.0
+    wm_real = torch.zeros((n, c_all, target_h, target_w), device=device, dtype=torch.float32)
+    wm_imag = torch.zeros_like(wm_real)
+    wm_mask = torch.zeros((n, c_all, target_h, target_w), device=device, dtype=torch.bool)
+
+    wm_real[:, HSQR_WATERMARK_CHANNEL, row_slice, col_slice] = qr_sign
+    wm_imag[:, HSQR_WATERMARK_CHANNEL, row_slice, col_slice] = torch.flip(qr_sign, dims=[-1])
+    wm_mask[:, HSQR_WATERMARK_CHANNEL, row_slice, col_slice] = True
+    return torch.complex(wm_real, wm_imag), wm_mask
+
+@torch.no_grad()
+def _cartesian_to_polar_sample_grid(h, w, device):
+    # grid_sample uses normalized coords in [-1,1], where x is theta-axis and y is radius-axis.
+    ys = torch.linspace(-(h // 2), h // 2 - 1, h, device=device, dtype=torch.float32)
+    xs = torch.linspace(-(w // 2), w // 2 - 1, w, device=device, dtype=torch.float32)
+    yy, xx = torch.meshgrid(ys, xs, indexing="ij")
+    max_r = float(min(h, w) // 2)
+    rr = torch.sqrt(xx * xx + yy * yy) / max_r
+    rr = rr.clamp(0.0, 1.0)
+    theta = (torch.atan2(yy, xx) + np.pi) / (2.0 * np.pi)
+    grid_x = theta * 2.0 - 1.0
+    grid_y = rr * 2.0 - 1.0
+    return torch.stack([grid_x, grid_y], dim=-1) # (H,W,2)
+
+@torch.no_grad()
+def _embed_hsqr_polar(latent_fft, qr_tensor, alpha=0.08):
+    """
+    Polar-domain embedding with Hermitian pairing:
+    W(r,theta) = conj(W(r,theta+pi)), then mapped back by grid_sample.
+    """
+    n, c_all, h, w = latent_fft.shape
+    device = latent_fft.device
+    r_bins = h // 2
+    t_bins = w
+
+    qr_sign = qr_tensor.to(device=device, dtype=torch.float32) * 2.0 - 1.0
+    radial_code = torch.mean(qr_sign, dim=-1, keepdim=True)          # (N,c_wm,42,1)
+    radial_code = F.interpolate(radial_code, size=(r_bins, 1), mode="bilinear", align_corners=True).squeeze(-1) # (N,c_wm,R)
+    theta_code = torch.mean(qr_sign, dim=-2, keepdim=True)           # (N,c_wm,1,42)
+    theta_code = F.interpolate(theta_code, size=(1, t_bins), mode="bilinear", align_corners=True).squeeze(-2)    # (N,c_wm,T)
+    polar_real = radial_code.unsqueeze(-1) * theta_code.unsqueeze(-2) # (N,c_wm,R,T)
+    polar_imag = torch.roll(polar_real, shifts=t_bins // 4, dims=-1)
+    polar_complex = torch.complex(polar_real, polar_imag)
+
+    # Enforce polar conjugate pairing.
+    polar_pair = torch.roll(torch.conj(polar_complex), shifts=t_bins // 2, dims=-1)
+    polar_complex = 0.5 * (polar_complex + polar_pair)
+
+    polar_real_full = torch.zeros((n, c_all, r_bins, t_bins), device=device, dtype=torch.float32)
+    polar_imag_full = torch.zeros_like(polar_real_full)
+    polar_real_full[:, HSQR_WATERMARK_CHANNEL] = polar_complex.real
+    polar_imag_full[:, HSQR_WATERMARK_CHANNEL] = polar_complex.imag
+
+    sample_grid = _cartesian_to_polar_sample_grid(h, w, device=device).unsqueeze(0).repeat(n, 1, 1, 1)
+    wm_real = F.grid_sample(polar_real_full, sample_grid, mode="bilinear", padding_mode="zeros", align_corners=True)
+    wm_imag = F.grid_sample(polar_imag_full, sample_grid, mode="bilinear", padding_mode="zeros", align_corners=True)
+    freq_new = latent_fft + alpha * torch.complex(wm_real, wm_imag)
+    return enforce_hermitian_symmetry(freq_new)
+
+@torch.no_grad()
+def _embed_hsqr_adaptive(latent_fft, qr_tensor, alpha=0.08):
+    """
+    Adaptive energy-aware embedding:
+        M = |F|
+        F' = F + alpha * M * W
+    """
+    wm_complex, _ = _build_hsqr_wm_complex(qr_tensor, latent_fft.shape[-2], latent_fft.shape[-1], latent_fft.device)
+    magnitude = torch.abs(latent_fft)
+    magnitude = magnitude / (magnitude.mean(dim=(-2, -1), keepdim=True) + 1e-6)
+    freq_new = latent_fft + alpha * magnitude * wm_complex
+    return enforce_hermitian_symmetry(freq_new)
+
+@torch.no_grad()
+def _embed_hsqr_freq(latent_fft, qr_tensor, method):
+    if method == "polar":
+        return _embed_hsqr_polar(latent_fft, qr_tensor)
+    if method == "adaptive":
+        return _embed_hsqr_adaptive(latent_fft, qr_tensor)
+    raise ValueError(f"Unknown HSQR method: {method}")
+
+@torch.no_grad()
+def inject_hsqr(inverted_latent, qr_tensor, center=False, device="cuda", method="original"): # (N,4,64,64) -> (N,4,64,64)
     assert len(qr_tensor.shape) == 4 # (N,c_wm,42,42)
     inverted_latent = inverted_latent.to(device)
     qr_tensor = qr_tensor.to(device)
@@ -415,39 +512,54 @@ def inject_hsqr(inverted_latent, qr_tensor, center=False, device="cuda"): # (N,4
     qr_pix_half = (qr_pix_len + 1) // 2 # 21
     qr_left = qr_tensor[:, :, :, :qr_pix_half]    # (N,c_wm,42,21) boolean
     qr_right = qr_tensor[:, :, :, qr_pix_half:]   # (N,c_wm,42,21) boolean
-    if center:
-        # rfft
-        center_latent_rfft = rfft(inverted_latent[center_slice]) # (N,4,44,44) -> # (N,4,44,23) complex64
-        center_real_batch = center_latent_rfft.real # (N,4,44,23) f32
-        center_imag_batch = center_latent_rfft.imag # (N,4,44,23) f32
-        real_slice = (slice(None), HSQR_WATERMARK_CHANNEL, slice(1, 1+qr_pix_len), slice(1, 1+qr_pix_half))
-        imag_slice = (slice(None), HSQR_WATERMARK_CHANNEL, slice(1, 1+qr_pix_len), slice(1, 1+qr_pix_half))
-        #center=True  [:,[3], 1:43,1:22] (N,1,42,21)
-        center_real_batch[real_slice] = qr_abs(qr_left, center_real_batch[real_slice], delta=delta) # (N,c_wm,42,21)
-        center_imag_batch[imag_slice] = qr_abs(qr_right, center_imag_batch[imag_slice], delta=delta) # (N,c_wm,42,21)
-        center_latent_ifft = irfft(torch.complex(center_real_batch, center_imag_batch)) # (N,4,44,44) f32
-        inverted_latent = inverted_latent.clone()
-        inverted_latent[center_slice] = center_latent_ifft
-        return inverted_latent # (N,4,64,64)
-    else:
-        # Coordinates for HSQR injection
-        center_row = inverted_latent.shape[-2] // 2 # 32
-        row_start = center_row - qr_pix_half + (1 if qr_pix_len % 2 else 0) # if odd length QR, plus 1
-        row_end = center_row + qr_pix_half
-        col_end_left = 1 + qr_pix_half
-        col_end_right = qr_pix_half if qr_pix_len % 2 else col_end_left # if odd length QR, shortend by 1 pix
-        # rfft
-        latent_rfft = rfft(inverted_latent) # (N,4,64,64) -> (N,4,64,33) complex64
-        real_batch = latent_rfft.real # (N,4,64,33) f32
-        imag_batch = latent_rfft.imag # (N,4,64,33) f32
-        # Inject HSQR
-        # [row_start 11 = 32-21 : row_end 53 = 32+21] / [col_start 1 : col_end_left 22 = 1+21 = col_end_right 22]
-        real_slice = (slice(None), HSQR_WATERMARK_CHANNEL, slice(row_start, row_end), slice(1, col_end_left))
-        imag_slice = (slice(None), HSQR_WATERMARK_CHANNEL, slice(row_start, row_end), slice(1, col_end_right))
-        #center=False [:,[3],11:53,1:22] (N,1,42,21)
-        real_batch[real_slice] = qr_abs(qr_left, real_batch[real_slice], delta=delta) # (N,c_wm,42,21)
-        imag_batch[imag_slice] = qr_abs(qr_right, imag_batch[imag_slice], delta=delta) # (N,c_wm,42,21)
-        return irfft(torch.complex(real_batch, imag_batch)) # (N,4,64,64)
+    if method == "original":
+        if center:
+            # rfft
+            center_latent_rfft = rfft(inverted_latent[center_slice]) # (N,4,44,44) -> # (N,4,44,23) complex64
+            center_real_batch = center_latent_rfft.real # (N,4,44,23) f32
+            center_imag_batch = center_latent_rfft.imag # (N,4,44,23) f32
+            real_slice = (slice(None), HSQR_WATERMARK_CHANNEL, slice(1, 1+qr_pix_len), slice(1, 1+qr_pix_half))
+            imag_slice = (slice(None), HSQR_WATERMARK_CHANNEL, slice(1, 1+qr_pix_len), slice(1, 1+qr_pix_half))
+            #center=True  [:,[3], 1:43,1:22] (N,1,42,21)
+            center_real_batch[real_slice] = qr_abs(qr_left, center_real_batch[real_slice], delta=delta) # (N,c_wm,42,21)
+            center_imag_batch[imag_slice] = qr_abs(qr_right, center_imag_batch[imag_slice], delta=delta) # (N,c_wm,42,21)
+            center_latent_ifft = irfft(torch.complex(center_real_batch, center_imag_batch)) # (N,4,44,44) f32
+            inverted_latent = inverted_latent.clone()
+            inverted_latent[center_slice] = center_latent_ifft
+            return inverted_latent # (N,4,64,64)
+        else:
+            # Coordinates for HSQR injection
+            center_row = inverted_latent.shape[-2] // 2 # 32
+            row_start = center_row - qr_pix_half + (1 if qr_pix_len % 2 else 0) # if odd length QR, plus 1
+            row_end = center_row + qr_pix_half
+            col_end_left = 1 + qr_pix_half
+            col_end_right = qr_pix_half if qr_pix_len % 2 else col_end_left # if odd length QR, shortend by 1 pix
+            # rfft
+            latent_rfft = rfft(inverted_latent) # (N,4,64,64) -> (N,4,64,33) complex64
+            real_batch = latent_rfft.real # (N,4,64,33) f32
+            imag_batch = latent_rfft.imag # (N,4,64,33) f32
+            # Inject HSQR
+            # [row_start 11 = 32-21 : row_end 53 = 32+21] / [col_start 1 : col_end_left 22 = 1+21 = col_end_right 22]
+            real_slice = (slice(None), HSQR_WATERMARK_CHANNEL, slice(row_start, row_end), slice(1, col_end_left))
+            imag_slice = (slice(None), HSQR_WATERMARK_CHANNEL, slice(row_start, row_end), slice(1, col_end_right))
+            #center=False [:,[3],11:53,1:22] (N,1,42,21)
+            real_batch[real_slice] = qr_abs(qr_left, real_batch[real_slice], delta=delta) # (N,c_wm,42,21)
+            imag_batch[imag_slice] = qr_abs(qr_right, imag_batch[imag_slice], delta=delta) # (N,c_wm,42,21)
+            return irfft(torch.complex(real_batch, imag_batch)) # (N,4,64,64)
+
+    if method in ["polar", "adaptive"]:
+        if center:
+            center_latent_fft = fft(inverted_latent[center_slice])  # (N,4,44,44)
+            center_latent_fft = _embed_hsqr_freq(center_latent_fft, qr_tensor, method=method)
+            center_latent_ifft = ifft(center_latent_fft).real
+            inverted_latent = inverted_latent.clone()
+            inverted_latent[center_slice] = center_latent_ifft
+            return inverted_latent
+        latent_fft = fft(inverted_latent)  # (N,4,64,64)
+        latent_fft = _embed_hsqr_freq(latent_fft, qr_tensor, method=method)
+        return ifft(latent_fft).real
+
+    raise ValueError(f"Unsupported method: {method}")
 
 # ====================================================================================================
 

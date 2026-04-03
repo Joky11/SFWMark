@@ -141,3 +141,59 @@ def oss_embed(
     z_wm = z.clone()
     z_wm[center_slice] = z_wm_center
     return z_wm
+
+
+def oss_extract(
+    z_hat: torch.Tensor,
+    seed: int,
+    num_bits: int,
+    debug: bool = False,
+) -> list[int]:
+    """从潜在变量的频域表示中提取嵌入的多比特信息。
+
+    参数:
+        z_hat:    (N, 4, H, W) 实数潜在变量（可能经过 DDIM Inversion 恢复）。
+        seed:     码片生成种子（必须与嵌入时相同）。
+        num_bits: 嵌入的比特数。
+        debug:    是否打印调试信息。
+
+    返回:
+        长度为 num_bits 的比特列表，元素为 0 或 1。
+    """
+    # ---- 提取中心区域并 FFT ----
+    z_hat_center = z_hat[center_slice].clone()   # (N, 4, 44, 44)
+    X_hat = fft(z_hat_center)                    # (N, 4, 44, 44) complex
+
+    # ---- Free_Half_Region ----
+    X_hat_free = X_hat[:, :, :, 23:].clone()     # (N, 4, 44, 21)
+
+    # ---- 调试：均值归一化前统计 ----
+    if debug:
+        print(
+            f"[OSS extract] X_hat_free 归一化前 — "
+            f"mean: {X_hat_free.mean():.6f}, std: {X_hat_free.std():.6f}"
+        )
+
+    # ---- 均值归一化 ----
+    X_hat_free = X_hat_free - X_hat_free.mean()
+
+    # ---- 调试：均值归一化后统计 ----
+    if debug:
+        print(
+            f"[OSS extract] X_hat_free 归一化后 — "
+            f"mean: {X_hat_free.mean():.6f}, std: {X_hat_free.std():.6f}"
+        )
+
+    # ---- 重新生成码片 ----
+    chip_shape = X_hat_free.shape[1:]            # (4, 44, 21)
+    chips = generate_orthogonal_keys(num_bits, chip_shape, seed)
+
+    # ---- 相关性检测与比特判定 ----
+    bits: list[int] = []
+    for i in range(num_bits):
+        corr = (X_hat_free * chips[i].conj().to(X_hat_free.device)).real.sum().item()
+        if debug:
+            print(f"[OSS extract] bit {i}: corr = {corr:.6f}")
+        bits.append(1 if corr > 0 else 0)
+
+    return bits

@@ -1,0 +1,4 @@
+# file: /data1/lyx/project/SFWMark/src/utils.py
+# hypothesis_version: 6.151.10
+
+[-45.0, 0.0, 1e-10, 1e-06, 0.001, 0.08, 0.5, 1.0, 2.0, 45.0, 255.0, 200, 224, 255, 360, 512, 2048, 7433, 999999, '-Inf', 'DB1k', 'Gustavo', 'H != W', 'Inf', 'JPEG', 'L', 'Prompt', 'RGB', 'adaptive', 'annotations', 'bilinear', 'black', 'caption', 'coco', 'complex', 'cuda', 'ij', 'imag', 'latent', 'noise', 'original', 'polar', 'prompt', 'qrcode.png', 'real', 'shape', 'strings', 'vgg', 'white', 'x_hat', 'zeros']

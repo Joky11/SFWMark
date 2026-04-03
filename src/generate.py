@@ -29,7 +29,7 @@ def main(args):
     np.save(os.path.join(save_dir, f"identify_gt_indices_{num_dataset}.npy"), identify_gt_indices)
     
     # [Stable-Diffusion-v2-1-base Settings]
-    model_id = "stabilityai/stable-diffusion-2-1-base"
+    model_id = "/data1/lyx/model/stable-diffusion-2-1-base"
     resolution = 512
     torch_dtype = torch.float32
 

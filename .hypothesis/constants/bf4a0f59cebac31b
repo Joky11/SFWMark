@@ -1,0 +1,4 @@
+# file: /data1/lyx/project/SFWMark/src/pytorch_fid/fid_score.py
+# hypothesis_version: 6.151.10
+
+[1e-06, 0.001, 299, 2048, '*.{}', '--batch-size', '--device', '--dims', '--num-workers', '--save-stats', '.npz', 'Batch size to use', 'FID: ', 'Invalid path: %s', 'RGB', '__main__', 'bmp', 'cpu', 'cuda', 'jpeg', 'jpg', 'mu', 'path', 'pgm', 'png', 'ppm', 'sigma', 'store_true', 'tif', 'tiff', 'webp']
