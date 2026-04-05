@@ -1,0 +1,4 @@
+# file: /data1/lyx/project/SFWMark/src/oss.py
+# hypothesis_version: 6.151.10
+
+[1e-05, 0.5, 'msg 中的元素必须为 0 或 1']

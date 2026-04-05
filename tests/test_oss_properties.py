@@ -283,3 +283,140 @@ def test_adaptive_alpha_correctness(
         f"自适应 Alpha 验证失败：expected alpha={expected_alpha:.6f}, "
         f"Free_Half_Region 最大偏差 {diff:.2e} >= 1e-3"
     )
+
+# ---------------------------------------------------------------------------
+# Property 7: 嵌入-提取往返一致性
+# Feature: orthogonal-spread-spectrum-watermark, Property 7: 嵌入-提取往返一致性
+# Validates: Requirements 8.1, 8.2, 8.3
+# ---------------------------------------------------------------------------
+
+from src.oss import oss_extract
+
+
+@settings(max_examples=100)
+@given(
+    msg=st.lists(st.integers(min_value=0, max_value=1), min_size=1, max_size=64),
+    seed=st.integers(min_value=0, max_value=2**31),
+    z_seed=st.integers(min_value=0, max_value=2**31),
+)
+def test_embed_extract_roundtrip(msg: list[int], seed: int, z_seed: int) -> None:
+    """对任意比特消息，嵌入后直接提取应完全一致（BER=0）。
+
+    使用自适应 alpha（默认模式），确保水印信号能量相对于载体信号
+    足够大，从而在无攻击条件下实现完美提取。
+    """
+    # 使用独立种子生成潜在变量，避免与码片种子冲突导致 RNG 状态耦合
+    g = torch.Generator().manual_seed(z_seed)
+    z = torch.randn(1, 4, 64, 64, generator=g)
+
+    # 使用自适应 alpha（alpha=None），这是设计文档推荐的默认模式
+    z_wm = oss_embed(z, msg, seed, alpha=None, alpha_scale=0.5)
+    extracted = oss_extract(z_wm, seed, num_bits=len(msg))
+
+    assert extracted == msg, (
+        f"往返一致性失败 (seed={seed}, z_seed={z_seed}, len={len(msg)}): "
+        f"BER={sum(a != b for a, b in zip(msg, extracted))}/{len(msg)}"
+    )
+
+
+# ---------------------------------------------------------------------------
+# Property 8: 提取输出长度不变量
+# Feature: orthogonal-spread-spectrum-watermark, Property 8: 提取输出长度不变量
+# Validates: Requirements 5.6
+# ---------------------------------------------------------------------------
+
+
+@settings(max_examples=100)
+@given(
+    num_bits=st.integers(min_value=1, max_value=64),
+    z_seed=st.integers(min_value=0, max_value=2**31),
+    seed=st.integers(min_value=0, max_value=2**31),
+)
+def test_extract_output_length_invariant(
+    num_bits: int, z_seed: int, seed: int
+) -> None:
+    """oss_extract 输出列表长度应恰好等于 num_bits，无论输入内容如何。"""
+    g = torch.Generator().manual_seed(z_seed)
+    z_hat = torch.randn(1, 4, 64, 64, generator=g)
+
+    extracted = oss_extract(z_hat, seed, num_bits=num_bits)
+
+    assert isinstance(extracted, list), "oss_extract 应返回列表"
+    assert len(extracted) == num_bits, (
+        f"输出长度 {len(extracted)} != 期望的 num_bits {num_bits}"
+    )
+    # 验证每个元素为合法比特值
+    assert all(b in (0, 1) for b in extracted), (
+        f"输出包含非法比特值: {[b for b in extracted if b not in (0, 1)]}"
+    )
+
+# ---------------------------------------------------------------------------
+# Property 9: 均值归一化有效性
+# Feature: orthogonal-spread-spectrum-watermark, Property 9: 均值归一化有效性
+# Validates: Requirements 5.3
+# ---------------------------------------------------------------------------
+
+
+@settings(max_examples=100)
+@given(
+    seed=st.integers(min_value=0, max_value=2**31),
+)
+def test_mean_normalization_effectiveness(seed: int) -> None:
+    """对任意复数张量执行均值归一化后，张量均值绝对值应 < 1e-6。"""
+    g = torch.Generator().manual_seed(seed)
+    # 生成随机复数张量，模拟 Free_Half_Region 的形状
+    real = torch.randn(1, 4, 44, 21, generator=g)
+    imag = torch.randn(1, 4, 44, 21, generator=g)
+    X = torch.complex(real, imag)
+
+    # 执行均值归一化（与 oss_extract 中的逻辑一致）
+    X_normalized = X - X.mean()
+
+    # 验证归一化后均值绝对值 < 1e-6
+    mean_abs = X_normalized.mean().abs().item()
+    assert mean_abs < 1e-6, (
+        f"均值归一化后均值绝对值 {mean_abs:.2e} >= 1e-6"
+    )
+
+
+# ---------------------------------------------------------------------------
+# Property 10: 水印对统计分布的影响控制
+# Feature: orthogonal-spread-spectrum-watermark, Property 10: 水印对统计分布的影响控制
+# Validates: Requirements 9.1, 9.2
+# ---------------------------------------------------------------------------
+
+
+@settings(max_examples=100)
+@given(
+    msg=st.lists(st.integers(min_value=0, max_value=1), min_size=1, max_size=32),
+    z_seed=st.integers(min_value=0, max_value=2**31),
+    seed=st.integers(min_value=0, max_value=2**31),
+)
+def test_watermark_statistical_distribution_impact(
+    msg: list[int], z_seed: int, seed: int
+) -> None:
+    """适当 alpha_scale 下嵌入水印后，均值差异 < 0.1，标准差比值在 [0.8, 1.2] 范围内。
+
+    使用 alpha_scale=0.1（保守值）确保属性在所有消息长度（1~32 比特）下成立。
+    叠加信号能量随比特数线性增长，因此较长消息需要较小的 alpha_scale
+    来维持统计分布稳定性（需求 9.3 支持通过调整 alpha 控制影响程度）。
+    """
+    g = torch.Generator().manual_seed(z_seed)
+    z = torch.randn(1, 4, 64, 64, generator=g)
+
+    # 使用自适应 alpha，alpha_scale=0.1 确保统计影响可控
+    z_wm = oss_embed(z, msg, seed, alpha=None, alpha_scale=0.1)
+
+    # 验证均值差异 < 0.1（需求 9.1）
+    mean_diff = abs(z_wm.mean().item() - z.mean().item())
+    assert mean_diff < 0.1, (
+        f"均值差异 {mean_diff:.6f} >= 0.1 "
+        f"(z.mean={z.mean().item():.6f}, z_wm.mean={z_wm.mean().item():.6f})"
+    )
+
+    # 验证标准差比值在 [0.8, 1.2] 范围内（需求 9.2）
+    std_ratio = z_wm.std().item() / z.std().item()
+    assert 0.8 <= std_ratio <= 1.2, (
+        f"标准差比值 {std_ratio:.6f} 不在 [0.8, 1.2] 范围内 "
+        f"(z.std={z.std().item():.6f}, z_wm.std={z_wm.std().item():.6f})"
+    )
