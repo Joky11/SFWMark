@@ -1,4 +1,5 @@
 import os
+import math
 import itertools
 from tqdm import tqdm
 from pathlib import Path
@@ -53,33 +54,42 @@ def main(args):
     save_identify_name = "identify-acc.npz"
 
     with torch.no_grad():
-        # [Load Ground-Truth patterns]
-        Fourier_watermark_pattern_list = torch.load(os.path.join(save_dir, f"pattern_list-{wm_capacity}.pt")).cpu()
+        # [Load Ground-Truth patterns / OSS 参数]
+        if args.wm_type == "OSS":
+            from oss import oss_extract
+            # OSS 使用比特流匹配，不需要加载 pattern_list
+            oss_num_bits = math.ceil(math.log2(wm_capacity))  # 11 比特编码 2048 个身份
+            oss_seed = w_seed  # 与 generate.py 中相同的码片生成种子
+            oss_msg_list = np.load(os.path.join(save_dir, f"oss_msg_list_{num_dataset}.npy"))
+            save_verify_name = "verify-ber.npz"
+        else:
+            Fourier_watermark_pattern_list = torch.load(os.path.join(save_dir, f"pattern_list-{wm_capacity}.pt")).cpu()
 
-        # [Evaluation methods]
-        is_center = args.wm_type in ["HSTR", "HSQR"]
-        channel_min = args.wm_type in ["RingID", "HSTR"]
-        if args.wm_type in ["Tree-Ring", "RingID", "HSTR"]:
-            eval_method = {"Distance":"L1", "Metrics":"|a-b|", "func":get_distance, 
-                "kwargs":{"p":1, "center": is_center, 
-                    "mode":"complex", "channel_min":channel_min}}
-        elif args.wm_type == "HSQR":
-            eval_method = {"Distance":"L1", "Metrics":"|a-b|", "func":get_distance_hsqr, 
-                "kwargs":{"p":1, "center": is_center}}
-        
-        # [Detection Area] Channel and Mask
-        channel = RINGID_WATERMARK_CHANNEL if args.wm_type in ["RingID", "HSTR"] else TREE_WATERMARK_CHANNEL
-        if args.wm_type == "Tree-Ring":
-            mask = watermark_region_mask_tree.cpu() # (1,64,64), r=14 inner-circle mask (boolean)
-        elif args.wm_type == "RingID":
-            mask = watermark_region_mask_ringid.cpu() # (C_R+C_H,64,64)
-        elif args.wm_type == "HSTR":
-            mask = watermark_region_mask_hstr.cpu() # (C_R+C_H,64,64)
+            # [Evaluation methods]
+            is_center = args.wm_type in ["HSTR", "HSQR"]
+            channel_min = args.wm_type in ["RingID", "HSTR"]
+            if args.wm_type in ["Tree-Ring", "RingID", "HSTR"]:
+                eval_method = {"Distance":"L1", "Metrics":"|a-b|", "func":get_distance, 
+                    "kwargs":{"p":1, "center": is_center, 
+                        "mode":"complex", "channel_min":channel_min}}
+            elif args.wm_type == "HSQR":
+                eval_method = {"Distance":"L1", "Metrics":"|a-b|", "func":get_distance_hsqr, 
+                    "kwargs":{"p":1, "center": is_center}}
+            
+            # [Detection Area] Channel and Mask
+            channel = RINGID_WATERMARK_CHANNEL if args.wm_type in ["RingID", "HSTR"] else TREE_WATERMARK_CHANNEL
+            if args.wm_type == "Tree-Ring":
+                mask = watermark_region_mask_tree.cpu() # (1,64,64), r=14 inner-circle mask (boolean)
+            elif args.wm_type == "RingID":
+                mask = watermark_region_mask_ringid.cpu() # (C_R+C_H,64,64)
+            elif args.wm_type == "HSTR":
+                mask = watermark_region_mask_hstr.cpu() # (C_R+C_H,64,64)
         
         print("Attack-Detection Starts")
         for idx in tqdm(RANGE_EVAL):
             key_index = identify_gt_indices[idx]
-            pattern_gt = Fourier_watermark_pattern_list[key_index].cpu()
+            if args.wm_type != "OSS":
+                pattern_gt = Fourier_watermark_pattern_list[key_index].cpu()
             # Set random seed
             this_seed = 42 + idx
             set_random_seed(this_seed)
@@ -113,48 +123,87 @@ def main(args):
             Fourier_wm_distorted_zT = ddim_invert(pipe, img_pil_wm_distorted_list, invert_guidance=0).cpu() # (N_attack,4,64,64)
             np.save(os.path.join(inverted_path, f"{idx}-no_latents.npy"), no_wm_distorted_zT.numpy())
             np.save(os.path.join(inverted_path, f"{idx}-wm_latents.npy"), Fourier_wm_distorted_zT.numpy())
-            
-            # Latent Fourier
-            if args.wm_type in ["Tree-Ring", "RingID"]:
-                no_wm_distorted_zT_fft = fft(no_wm_distorted_zT)
-                Fourier_wm_distorted_zT_fft = fft(Fourier_wm_distorted_zT)
-            elif args.wm_type in ["HSTR", "HSQR"]:
-                no_wm_distorted_zT_fft = torch.zeros_like(no_wm_distorted_zT, dtype=torch.complex64) # (N_attack,4,64,64)
-                Fourier_wm_distorted_zT_fft = torch.zeros_like(Fourier_wm_distorted_zT, dtype=torch.complex64) # (N_attack,4,64,64)
-                no_wm_distorted_zT_fft[center_slice] = fft(no_wm_distorted_zT[center_slice]) # (N_attack,4,44,44)
-                Fourier_wm_distorted_zT_fft[center_slice] = fft(Fourier_wm_distorted_zT[center_slice]) # (N_attack,4,44,44)
 
-            # [Verification] Calculating L1 distances - for ROC Curves (TPR, FPR, Thresholds)
-            no_wm_result = []
-            Fourier_wm_result = []
-            for distortion_index in range(len(distorted_image_list)): # 12 Cases
-                no_wm_zT_fft = no_wm_distorted_zT_fft[distortion_index][None, ...] # (1,4,64,64)
-                Fourier_wm_zT_fft = Fourier_wm_distorted_zT_fft[distortion_index][None, ...] # (1,4,64,64)
-                if args.wm_type in ["Tree-Ring", "RingID", "HSTR"]:
-                    no_wm_verify_l1 = -eval_method['func'](pattern_gt, no_wm_zT_fft, mask=mask, channel=channel, **eval_method['kwargs'])
-                    Fourier_wm_verify_l1 = -eval_method['func'](pattern_gt, Fourier_wm_zT_fft, mask=mask, channel=channel, **eval_method['kwargs'])
-                elif args.wm_type == "HSQR":
-                    no_wm_verify_l1 = -eval_method['func'](pattern_gt, no_wm_zT_fft, channel=channel, **eval_method['kwargs'])
-                    Fourier_wm_verify_l1 = -eval_method['func'](pattern_gt, Fourier_wm_zT_fft, channel=channel, **eval_method['kwargs'])
-                no_wm_result.append(no_wm_verify_l1)
-                Fourier_wm_result.append(Fourier_wm_verify_l1)
-            no_watermark_results_list.append(no_wm_result)
-            Fourier_watermark_results_list.append(Fourier_wm_result)
+            if args.wm_type == "OSS":
+                # ---- OSS 检测分支 ----
+                gt_msg = oss_msg_list[idx].tolist()  # 该图像的 ground-truth 比特消息
 
-            # [Identification] Ground-Truth Pattern Matching Accuracy (Perfect-Match:1 / Not-Match:0)
-            id_acc_result = []
-            for distortion_index in range(len(distorted_image_list)): # 12 Cases
-                Fourier_wm_zT_fft = Fourier_wm_distorted_zT_fft[distortion_index][None, ...] # (1,4,64,64)
-                candidate_distances_list = []
-                for Fourier_watermark_pattern in Fourier_watermark_pattern_list:  # traverse all candidate patterns
+                # [Verification] 使用 BER 作为验证指标
+                # 约定：BER 越低表示越可能含水印 → 取负 BER 作为"得分"，与其他方法的 -L1 语义一致
+                no_wm_result = []
+                Fourier_wm_result = []
+                for distortion_index in range(len(distorted_image_list)):
+                    # 无水印图像：提取比特并计算 BER
+                    no_wm_zT = no_wm_distorted_zT[distortion_index][None, ...]  # (1,4,64,64)
+                    no_wm_bits = oss_extract(no_wm_zT, oss_seed, oss_num_bits)
+                    no_wm_ber = sum(a != b for a, b in zip(no_wm_bits, gt_msg)) / oss_num_bits
+                    no_wm_result.append(-no_wm_ber)  # 取负值，与 -L1 语义一致
+
+                    # 有水印图像：提取比特并计算 BER
+                    wm_zT = Fourier_wm_distorted_zT[distortion_index][None, ...]  # (1,4,64,64)
+                    wm_bits = oss_extract(wm_zT, oss_seed, oss_num_bits)
+                    wm_ber = sum(a != b for a, b in zip(wm_bits, gt_msg)) / oss_num_bits
+                    Fourier_wm_result.append(-wm_ber)  # 取负值
+
+                no_watermark_results_list.append(no_wm_result)
+                Fourier_watermark_results_list.append(Fourier_wm_result)
+
+                # [Identification] 比特流内容匹配：提取比特 → 转换为索引 → 与 ground-truth 索引比较
+                id_acc_result = []
+                for distortion_index in range(len(distorted_image_list)):
+                    wm_zT = Fourier_wm_distorted_zT[distortion_index][None, ...]  # (1,4,64,64)
+                    wm_bits = oss_extract(wm_zT, oss_seed, oss_num_bits)
+                    # 比特串 → 整数索引
+                    extracted_index = 0
+                    for b in wm_bits:
+                        extracted_index = (extracted_index << 1) | b
+                    id_acc = (extracted_index == key_index)
+                    id_acc_result.append(id_acc)
+                id_acc_results_list.append(id_acc_result)
+
+            else:
+                # ---- 非 OSS 方法：原有 FFT + L1 距离检测逻辑 ----
+                # Latent Fourier
+                if args.wm_type in ["Tree-Ring", "RingID"]:
+                    no_wm_distorted_zT_fft = fft(no_wm_distorted_zT)
+                    Fourier_wm_distorted_zT_fft = fft(Fourier_wm_distorted_zT)
+                elif args.wm_type in ["HSTR", "HSQR"]:
+                    no_wm_distorted_zT_fft = torch.zeros_like(no_wm_distorted_zT, dtype=torch.complex64)
+                    Fourier_wm_distorted_zT_fft = torch.zeros_like(Fourier_wm_distorted_zT, dtype=torch.complex64)
+                    no_wm_distorted_zT_fft[center_slice] = fft(no_wm_distorted_zT[center_slice])
+                    Fourier_wm_distorted_zT_fft[center_slice] = fft(Fourier_wm_distorted_zT[center_slice])
+
+                # [Verification] Calculating L1 distances - for ROC Curves (TPR, FPR, Thresholds)
+                no_wm_result = []
+                Fourier_wm_result = []
+                for distortion_index in range(len(distorted_image_list)):
+                    no_wm_zT_fft = no_wm_distorted_zT_fft[distortion_index][None, ...]
+                    Fourier_wm_zT_fft = Fourier_wm_distorted_zT_fft[distortion_index][None, ...]
                     if args.wm_type in ["Tree-Ring", "RingID", "HSTR"]:
-                        candidate_distance = eval_method['func'](Fourier_watermark_pattern, Fourier_wm_zT_fft, mask=mask, channel=channel, **eval_method['kwargs'])
+                        no_wm_verify_l1 = -eval_method['func'](pattern_gt, no_wm_zT_fft, mask=mask, channel=channel, **eval_method['kwargs'])
+                        Fourier_wm_verify_l1 = -eval_method['func'](pattern_gt, Fourier_wm_zT_fft, mask=mask, channel=channel, **eval_method['kwargs'])
                     elif args.wm_type == "HSQR":
-                        candidate_distance = eval_method['func'](Fourier_watermark_pattern, Fourier_wm_zT_fft, channel=channel, **eval_method['kwargs'])
-                    candidate_distances_list.append(candidate_distance)
-                id_acc = np.argmin(np.array(candidate_distances_list)) == key_index
-                id_acc_result.append(id_acc)
-            id_acc_results_list.append(id_acc_result)
+                        no_wm_verify_l1 = -eval_method['func'](pattern_gt, no_wm_zT_fft, channel=channel, **eval_method['kwargs'])
+                        Fourier_wm_verify_l1 = -eval_method['func'](pattern_gt, Fourier_wm_zT_fft, channel=channel, **eval_method['kwargs'])
+                    no_wm_result.append(no_wm_verify_l1)
+                    Fourier_wm_result.append(Fourier_wm_verify_l1)
+                no_watermark_results_list.append(no_wm_result)
+                Fourier_watermark_results_list.append(Fourier_wm_result)
+
+                # [Identification] Ground-Truth Pattern Matching Accuracy
+                id_acc_result = []
+                for distortion_index in range(len(distorted_image_list)):
+                    Fourier_wm_zT_fft = Fourier_wm_distorted_zT_fft[distortion_index][None, ...]
+                    candidate_distances_list = []
+                    for Fourier_watermark_pattern in Fourier_watermark_pattern_list:
+                        if args.wm_type in ["Tree-Ring", "RingID", "HSTR"]:
+                            candidate_distance = eval_method['func'](Fourier_watermark_pattern, Fourier_wm_zT_fft, mask=mask, channel=channel, **eval_method['kwargs'])
+                        elif args.wm_type == "HSQR":
+                            candidate_distance = eval_method['func'](Fourier_watermark_pattern, Fourier_wm_zT_fft, channel=channel, **eval_method['kwargs'])
+                        candidate_distances_list.append(candidate_distance)
+                    id_acc = np.argmin(np.array(candidate_distances_list)) == key_index
+                    id_acc_result.append(id_acc)
+                id_acc_results_list.append(id_acc_result)
 
     # [Save results]
     no_watermark_results_list_array = np.array(no_watermark_results_list) # (1000,12)
@@ -198,7 +247,8 @@ def main(args):
     
     print()
     print("#" * 60)
-    print("Table 1: Verification Performance")
+    verify_label = "BER" if args.wm_type == "OSS" else "L1"
+    print(f"Table 1: Verification Performance ({verify_label})")
     table = PrettyTable()
     table.field_names = ["WM Type"] + case_names
     table.add_row([args.wm_type] + [f"{v:.3f}" for v in results["TPR@1%FPR"]])
@@ -217,7 +267,7 @@ def main(args):
 if __name__ == "__main__":
     import argparse
     parser = argparse.ArgumentParser(description="")
-    parser.add_argument("--wm_type", required=True, help="Choose watermarking methods")
+    parser.add_argument("--wm_type", choices=["Tree-Ring", "RingID", "HSTR", "HSQR", "OSS"], required=True, help="Choose watermarking methods")
     parser.add_argument("--dataset_id", choices=["coco", "Gustavo", "DB1k"], required=True, help="Choose dataset_id")
     parser.add_argument("--output_dir", default="outputs", help="output directory: ./[output_dir]/")
     args = parser.parse_args()

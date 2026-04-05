@@ -121,12 +121,12 @@
     - 生成器：随机 float 张量 + 随机消息
     - **验证: 需求 9.1, 9.2**
 
-- [ ] 5. 检查点 - 确保提取器和往返一致性正确
+- [x] 5. 检查点 - 确保提取器和往返一致性正确
   - 确保所有测试通过，如有疑问请向用户确认。
 
 
 - [ ] 6. 集成到 generate.py 生成流程
-  - [ ] 6.1 在 `src/generate.py` 中添加 `wm_type="OSS"` 分支
+  - [x] 6.1 在 `src/generate.py` 中添加 `wm_type="OSS"` 分支
     - 在 argparse 的 `--wm_type` choices 中添加 `"OSS"` 选项
     - 在水印模式生成分支中添加 OSS 逻辑：`from oss import oss_embed`
     - OSS 不需要预生成 `Fourier_watermark_pattern_list`，改为为每个图像生成唯一的比特消息
@@ -135,13 +135,13 @@
     - 保存每个图像对应的比特消息用于后续检测验证
     - _需求: 10.1, 10.2, 10.4_
 
-  - [ ]* 6.2 编写单元测试：验证 `wm_type="OSS"` 参数解析和基本集成逻辑
+  - [x] 6.2 编写单元测试：验证 `wm_type="OSS"` 参数解析和基本集成逻辑
     - 测试 argparse 接受 `"OSS"` 作为有效的 `wm_type` 值
     - 测试 OSS 分支的导入和基本调用不抛出异常
     - _需求: 10.1_
 
-- [ ] 7. 集成到 detect.py 检测流程
-  - [ ] 7.1 在 `src/detect.py` 中添加 `wm_type="OSS"` 分支
+- [x] 7. 集成到 detect.py 检测流程
+  - [x] 7.1 在 `src/detect.py` 中添加 `wm_type="OSS"` 分支
     - 在检测评估方法分支中添加 OSS 逻辑：`from oss import oss_extract`
     - DDIM Inversion 后调用 `oss_extract` 提取比特信息
     - 计算 BER（比特错误率）替代 L1 距离作为验证指标

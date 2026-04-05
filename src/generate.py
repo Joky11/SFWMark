@@ -1,4 +1,5 @@
 import os
+import math
 import itertools
 from tqdm import tqdm
 from pathlib import Path
@@ -40,37 +41,51 @@ def main(args):
     pipe.set_progress_bar_config(disable=True)
 
     # [Make GT patterns] wm_capacity=2048
-    if args.wm_type == "Tree-Ring":
-        masks = tree_masks
-        Fourier_watermark_pattern_list = [make_Fourier_treering_pattern(pipe, shape, this_w_seed) for this_w_seed in w_seed_list]
-    elif args.wm_type == "RingID":
-        # Following the official RingID implementation
-        masks = ringid_masks
-        single_channel_num_slots = RADIUS - RADIUS_CUTOFF # int(math.log2(wm_capacity))
-        key_value_list = [[list(combo) for combo in itertools.product(np.linspace(-64, 64, 2).tolist(), repeat=len(RING_WATERMARK_CHANNEL))] for _ in range(single_channel_num_slots)]
-        key_value_combinations = list(itertools.product(*key_value_list))
-        Fourier_watermark_pattern_list = [make_Fourier_ringid_pattern(pipe, shape, list(combo), w_seed=w_seed_list[i],
-            radius=RADIUS, radius_cutoff=RADIUS_CUTOFF,
-            ring_watermark_channel=RING_WATERMARK_CHANNEL, heter_watermark_channel=HETER_WATERMARK_CHANNEL,
-            heter_watermark_region_mask=heter_watermark_region_mask if len(HETER_WATERMARK_CHANNEL)>0 else None)
-            for i, combo in enumerate(key_value_combinations)]
-        # A. fix_gt (from official implementation)
-        Fourier_watermark_pattern_list = [fft(ifft(Fourier_watermark_pattern).real) for Fourier_watermark_pattern in Fourier_watermark_pattern_list]
-        # B. time_shift (from official implementation)
-        for Fourier_watermark_pattern in Fourier_watermark_pattern_list:
-            Fourier_watermark_pattern[:, RING_WATERMARK_CHANNEL, ...] = fft(torch.fft.fftshift(ifft(Fourier_watermark_pattern[:, RING_WATERMARK_CHANNEL, ...]), dim=(-1, -2)))
-    elif args.wm_type == "HSTR":
-        masks = tree_masks
-        masks[:, HETER_WATERMARK_CHANNEL] = single_channel_heter_watermark_mask # (64,64) RounderRingMask for Hetero Watermark (noise)
-        Fourier_watermark_pattern_list = [make_Fourier_treering_pattern(pipe, shape, this_w_seed, 
-            hs=True, center=True, heter=True) for this_w_seed in w_seed_list]
-    elif args.wm_type == "HSQR":
-        assert box_size == 2
-        Fourier_watermark_pattern_list = [make_hsqr_pattern(idx=this_w_seed) for this_w_seed in w_seed_list]
-    assert len(Fourier_watermark_pattern_list) == wm_capacity
-    
-    # [Save Fourier_watermark_pattern_list]
-    torch.save(torch.stack(Fourier_watermark_pattern_list, 0).detach(), os.path.join(save_dir, f"pattern_list-{wm_capacity}.pt"))
+    if args.wm_type == "OSS":
+        # OSS 不需要预生成 Fourier_watermark_pattern_list
+        # 将 identify_gt_indices 映射为二进制比特串作为每个图像的消息
+        from oss import oss_embed
+        oss_num_bits = math.ceil(math.log2(wm_capacity))  # 11 比特编码 2048 个身份
+        oss_seed = w_seed  # 复用全局种子作为码片生成种子
+        # 为每个图像预计算比特消息：索引 → 固定长度二进制比特串
+        oss_msg_list = []
+        for idx in identify_gt_indices:
+            bits = [(idx >> (oss_num_bits - 1 - b)) & 1 for b in range(oss_num_bits)]
+            oss_msg_list.append(bits)
+        # 保存比特消息映射用于后续检测验证
+        np.save(os.path.join(save_dir, f"oss_msg_list_{num_dataset}.npy"), np.array(oss_msg_list))
+    else:
+        if args.wm_type == "Tree-Ring":
+            masks = tree_masks
+            Fourier_watermark_pattern_list = [make_Fourier_treering_pattern(pipe, shape, this_w_seed) for this_w_seed in w_seed_list]
+        elif args.wm_type == "RingID":
+            # Following the official RingID implementation
+            masks = ringid_masks
+            single_channel_num_slots = RADIUS - RADIUS_CUTOFF # int(math.log2(wm_capacity))
+            key_value_list = [[list(combo) for combo in itertools.product(np.linspace(-64, 64, 2).tolist(), repeat=len(RING_WATERMARK_CHANNEL))] for _ in range(single_channel_num_slots)]
+            key_value_combinations = list(itertools.product(*key_value_list))
+            Fourier_watermark_pattern_list = [make_Fourier_ringid_pattern(pipe, shape, list(combo), w_seed=w_seed_list[i],
+                radius=RADIUS, radius_cutoff=RADIUS_CUTOFF,
+                ring_watermark_channel=RING_WATERMARK_CHANNEL, heter_watermark_channel=HETER_WATERMARK_CHANNEL,
+                heter_watermark_region_mask=heter_watermark_region_mask if len(HETER_WATERMARK_CHANNEL)>0 else None)
+                for i, combo in enumerate(key_value_combinations)]
+            # A. fix_gt (from official implementation)
+            Fourier_watermark_pattern_list = [fft(ifft(Fourier_watermark_pattern).real) for Fourier_watermark_pattern in Fourier_watermark_pattern_list]
+            # B. time_shift (from official implementation)
+            for Fourier_watermark_pattern in Fourier_watermark_pattern_list:
+                Fourier_watermark_pattern[:, RING_WATERMARK_CHANNEL, ...] = fft(torch.fft.fftshift(ifft(Fourier_watermark_pattern[:, RING_WATERMARK_CHANNEL, ...]), dim=(-1, -2)))
+        elif args.wm_type == "HSTR":
+            masks = tree_masks
+            masks[:, HETER_WATERMARK_CHANNEL] = single_channel_heter_watermark_mask # (64,64) RounderRingMask for Hetero Watermark (noise)
+            Fourier_watermark_pattern_list = [make_Fourier_treering_pattern(pipe, shape, this_w_seed, 
+                hs=True, center=True, heter=True) for this_w_seed in w_seed_list]
+        elif args.wm_type == "HSQR":
+            assert box_size == 2
+            Fourier_watermark_pattern_list = [make_hsqr_pattern(idx=this_w_seed) for this_w_seed in w_seed_list]
+        assert len(Fourier_watermark_pattern_list) == wm_capacity
+        
+        # [Save Fourier_watermark_pattern_list]
+        torch.save(torch.stack(Fourier_watermark_pattern_list, 0).detach(), os.path.join(save_dir, f"pattern_list-{wm_capacity}.pt"))
 
     print("Generation Starts")
     batch_size = 8
@@ -84,26 +99,37 @@ def main(args):
         set_random_seed(42 + batch_start)
 
         with torch.no_grad():
-            key_indices = [identify_gt_indices[key] for key in batch_indices]
-            pattern_gt_batch = [Fourier_watermark_pattern_list[key_index] for key_index in key_indices]
-            # adjust dims of pattern_gt_batch
-            if len(pattern_gt_batch[0].shape) == 4:
-                pattern_gt_batch = torch.cat(pattern_gt_batch, dim=0) # (N,4,64,64) for Tree-Ring, RingID, HSTR
-            elif len(pattern_gt_batch[0].shape) == 3:
-                pattern_gt_batch = torch.stack(pattern_gt_batch, dim=0) # (N,c_wm,42,42) for HSQR
-            else:
-                raise ValueError(f"Unexpected pattern_gt_batch shape: {pattern_gt_batch[0].shape}")
-            assert len(pattern_gt_batch.shape) == 4
-
-            # get random latents ~ N(0,I)
+            # 获取随机潜在变量 ~ N(0,I)
             no_watermark_latents = get_random_latents(pipe, batch_size=batch_size_actual) # (N,4,64,64)
-            # watermark injection
-            if args.wm_type in ["Tree-Ring", "RingID"]:
-                Fourier_watermark_latents, _ = inject_wm(no_watermark_latents, pattern_gt_batch, masks, cut_real=True, device=device)
-            elif args.wm_type == "HSTR":
-                Fourier_watermark_latents, _ = inject_wm(no_watermark_latents, pattern_gt_batch, masks, center=True, cut_real=False, device=device)
-            elif args.wm_type == "HSQR":
-                Fourier_watermark_latents = inject_hsqr(no_watermark_latents, pattern_gt_batch, center=True, device=device)
+
+            if args.wm_type == "OSS":
+                # OSS：逐图像嵌入各自的比特消息
+                wm_latents_list = []
+                for i, idx in enumerate(batch_indices):
+                    msg = oss_msg_list[idx]
+                    single_latent = no_watermark_latents[i:i+1]  # (1,4,64,64)
+                    wm_latent = oss_embed(single_latent, msg, oss_seed)
+                    wm_latents_list.append(wm_latent)
+                Fourier_watermark_latents = torch.cat(wm_latents_list, dim=0)  # (N,4,64,64)
+            else:
+                key_indices = [identify_gt_indices[key] for key in batch_indices]
+                pattern_gt_batch = [Fourier_watermark_pattern_list[key_index] for key_index in key_indices]
+                # 调整 pattern_gt_batch 维度
+                if len(pattern_gt_batch[0].shape) == 4:
+                    pattern_gt_batch = torch.cat(pattern_gt_batch, dim=0) # (N,4,64,64) for Tree-Ring, RingID, HSTR
+                elif len(pattern_gt_batch[0].shape) == 3:
+                    pattern_gt_batch = torch.stack(pattern_gt_batch, dim=0) # (N,c_wm,42,42) for HSQR
+                else:
+                    raise ValueError(f"Unexpected pattern_gt_batch shape: {pattern_gt_batch[0].shape}")
+                assert len(pattern_gt_batch.shape) == 4
+
+                # 水印注入
+                if args.wm_type in ["Tree-Ring", "RingID"]:
+                    Fourier_watermark_latents, _ = inject_wm(no_watermark_latents, pattern_gt_batch, masks, cut_real=True, device=device)
+                elif args.wm_type == "HSTR":
+                    Fourier_watermark_latents, _ = inject_wm(no_watermark_latents, pattern_gt_batch, masks, center=True, cut_real=False, device=device)
+                elif args.wm_type == "HSQR":
+                    Fourier_watermark_latents = inject_hsqr(no_watermark_latents, pattern_gt_batch, center=True, device=device)
             
             # generate images
             batched_latents = torch.cat([no_watermark_latents, Fourier_watermark_latents], dim=0) # (2N,4,64,64)
@@ -123,7 +149,7 @@ def main(args):
 if __name__ == "__main__":
     import argparse
     parser = argparse.ArgumentParser(description="")
-    parser.add_argument("--wm_type", choices=["Tree-Ring", "RingID", "HSTR", "HSQR"], required=True, help="Choose semantic watermarking methods following merged-in-generation scheme")
+    parser.add_argument("--wm_type", choices=["Tree-Ring", "RingID", "HSTR", "HSQR", "OSS"], required=True, help="Choose semantic watermarking methods following merged-in-generation scheme")
     parser.add_argument("--dataset_id", choices=["coco", "Gustavo", "DB1k"], required=True, help="Choose dataset_id")
     parser.add_argument("--output_dir", default="outputs", help="output directory: ./[output_dir]/")
     args = parser.parse_args()
