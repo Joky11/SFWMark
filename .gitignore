@@ -1,0 +1,34 @@
+# Python bytecode
+**/__pycache__/
+*.py[cod]
+*$py.class
+
+# 输出目录（生成的图片等）
+outputs/
+quick_outputs/
+
+# 数据集（需单独下载）
+src/text_dataset/
+src/text_dataset_old/
+
+# 实验结果数据文件
+src/results/**/*.npz
+src/results/**/*.npy
+
+# 日志文件
+src/logs/
+
+# pytest 缓存
+.pytest_cache/
+src/.pytest_cache/
+tests/.pytest_cache/
+
+# Hypothesis 测试数据
+.hypothesis/
+
+# 文档目录
+docs/
+
+# 杂项
+z/
+src/quick_start.py
